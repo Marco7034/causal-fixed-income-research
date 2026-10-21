@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# System / OS
+.DS_Store
+
+# Credentials and secrets
+.pgpass
+.env
+
