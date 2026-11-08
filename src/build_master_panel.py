@@ -25,7 +25,19 @@ def build_master_panel():
     df_fred.index.name = "date"
     
     # Load WRDS
-    df_trace = pd.read_csv(RAW_DIR / "wrds_trace_yields.csv", parse_dates=["date"])
+    df_trace = pd.read_csv(RAW_DIR / "wrds_trace_yields.csv", parse_dates=["date"]).sort_values(["cusip", "date"])
+    
+    # Strictly causal TRACE outlier filter:
+    # Remove single-day decimal-entry errors (>250 bps jump from trailing 5-day median)
+    trail_med = df_trace.groupby("cusip")["vwap_yield"].transform(
+        lambda s: s.shift(1).rolling(5, min_periods=1).median()
+    )
+    bad_tick_mask = (df_trace["vwap_yield"] - trail_med).abs() > 2.5
+    n_bad = int(bad_tick_mask.sum())
+    if n_bad > 0:
+        logger.info(f"   Filtered {n_bad} erroneous TRACE yield ticks (>250 bps from trailing 5d median).")
+        df_trace = df_trace.loc[~bad_tick_mask].copy()
+
     df_crsp = pd.read_csv(RAW_DIR / "wrds_crsp_equity.csv", parse_dates=["date"])
     df_comp = pd.read_csv(RAW_DIR / "wrds_compustat_leverage.csv", parse_dates=["date"])
     
@@ -110,8 +122,26 @@ def build_master_panel():
     # Merge FRED macro data based on date
     panel = pd.merge(panel, df_fred[['DGS10', 'T10Y2Y', 'VIX']], on='date', how='inner')
     
-    # Calculate Individual Bond Credit Spread (Yield - 10Y Treasury)
-    panel['CS_i'] = panel['vwap_yield'] - panel['DGS10']
+    # Calculate maturity-matched benchmark Treasury yield:
+    # 2Y rate = DGS10 - T10Y2Y
+    panel['DGS2'] = panel['DGS10'] - panel['T10Y2Y']
+    
+    # Interpolate along the Treasury curve based on actual TTM:
+    #   - For TTM <= 2 years: benchmark = DGS2
+    #   - For TTM >= 10 years: benchmark = DGS10
+    #   - For 2 < TTM < 10: linear interpolation
+    #   - If TTM missing: fall back to DGS10
+    if 'ttm_years' in panel.columns and panel['ttm_years'].notna().any():
+        ttm_clamped = panel['ttm_years'].clip(lower=2.0, upper=10.0)
+        interp_weight = (ttm_clamped - 2.0) / 8.0
+        panel['benchmark_treasury'] = panel['DGS2'] + interp_weight * panel['T10Y2Y']
+        panel['benchmark_treasury'] = panel['benchmark_treasury'].fillna(panel['DGS10'])
+    else:
+        panel['benchmark_treasury'] = panel['DGS10']
+    
+    # Calculate Maturity-Matched Credit Spread: Yield - Benchmark Treasury
+    panel['CS_i'] = panel['vwap_yield'] - panel['benchmark_treasury']
+    panel['CS_i_raw10y'] = panel['vwap_yield'] - panel['DGS10']
     
     # Sort securely by bond and date to compute daily differenced shocks
     panel = panel.sort_values(['cusip', 'date'])
@@ -122,8 +152,9 @@ def build_master_panel():
     panel['d_T10Y2Y'] = panel.groupby('cusip')['T10Y2Y'].diff()
     panel['d_VIX'] = panel.groupby('cusip')['VIX'].diff()
     
-    # Drop first days containing NaNs from differencing
+    # Drop first days containing NaNs from differencing and any residual >200bps single-day tick jumps
     panel = panel.dropna(subset=['d_CS_i', 'leverage'])
+    panel = panel.loc[panel['d_CS_i'].abs() <= 2.0].copy()
 
     logger.info(f"Master Panel Built: {len(panel)} rows across {panel['cusip'].nunique()} bonds.")
     
@@ -131,7 +162,7 @@ def build_master_panel():
 
     # Core columns (always present)
     cols = [
-        'cusip', 'issuer_cusip', 'date', 'CS_i', 'd_CS_i', 
+        'cusip', 'issuer_cusip', 'date', 'CS_i', 'd_CS_i', 'CS_i_raw10y',
         'daily_return', 'leverage', 'daily_volume', 'market_cap', 
         'd_DGS10', 'd_T10Y2Y', 'd_VIX',
     ]
